@@ -4,23 +4,26 @@ Stripped-down agent harness. ~150 lines. Inspired by mini-swe-agent.
 
 Model   : Minimax API  (MINIMAX_API_KEY)
 Search  : minimax-coding-plan-mcp  (same key, spawned once as subprocess)
-Tools   : web_search, read_file
+Tools   : web_search, bash
 Loop    : append-only message history; stop when model returns no tool_calls
 """
 
-import asyncio, json, os
+import asyncio, json, os, re, subprocess, sys
 from contextlib import AsyncExitStack
 from pathlib import Path
 
+from dotenv import load_dotenv
 import requests
+
+load_dotenv()
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 # ── Config (env) ─────────────────────────────────────────────────────────────
 MINIMAX_KEY  = os.environ["MINIMAX_API_KEY"]
 API_HOST     = os.environ.get("MINIMAX_API_HOST", "https://api.minimax.chat")
-MODEL        = os.environ.get("AGENT_MODEL", "MiniMax-Text-01")
-MAX_STEPS    = int(os.environ.get("AGENT_MAX_STEPS", "12"))
+MODEL        = os.environ.get("AGENT_MODEL", "MiniMax-2.7")
+MAX_STEPS    = int(os.environ.get("AGENT_MAX_STEPS", "100"))
 
 # ── Tool schemas (sent to model) ──────────────────────────────────────────────
 TOOL_DEFS = [
@@ -44,26 +47,55 @@ TOOL_DEFS = [
     {
         "type": "function",
         "function": {
-            "name": "read_file",
-            "description": "Read a local text, CSV, or JSON file (first 4000 chars).",
+            "name": "bash",
+            "description": (
+                "Run a shell command and return stdout+stderr (max 20000 chars). "
+                "Use for: fetching URLs (curl), parsing HTML/JSON (python3 -c), "
+                "reading/writing files, data processing. Timeout: 120s."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File path"}
+                    "command": {"type": "string", "description": "Shell command to execute"}
                 },
-                "required": ["path"],
+                "required": ["command"],
             },
         },
     },
 ]
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _strip_thinking(text: str) -> str:
+    """Remove <think>…</think> blocks from model output."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+def _log(step: int, tag: str, body: str, verbose: bool) -> None:
+    if not verbose:
+        return
+    GRAY, CYAN, GREEN, YELLOW, RESET = "\033[90m", "\033[36m", "\033[32m", "\033[33m", "\033[0m"
+    colors = {"think": GRAY, "tool_call": CYAN, "tool_result": GREEN, "answer": YELLOW}
+    c = colors.get(tag, RESET)
+    prefix = f"{GRAY}[step {step}]{RESET} {c}{tag}{RESET}"
+    # Truncate long bodies for readability
+    lines = body.split("\n")
+    if len(lines) > 30:
+        body = "\n".join(lines[:25]) + f"\n{GRAY}... ({len(lines) - 25} more lines){RESET}"
+    print(f"{prefix}\n{body}\n", file=sys.stderr)
+
+
 # ── Tool implementations ──────────────────────────────────────────────────────
-def _read_file(path: str) -> str:
-    p = Path(path)
-    if not p.exists():
-        return f"[read_file] File not found: {path}"
-    return p.read_text(encoding="utf-8", errors="replace")[:4000]
+def _run_bash(command: str, timeout: int = 120) -> str:
+    try:
+        r = subprocess.run(
+            ["bash", "-c", command],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        out = (r.stdout + r.stderr).strip()
+    except subprocess.TimeoutExpired:
+        out = f"[bash] Command timed out after {timeout}s"
+    return out[:20000] or "[bash] (no output)"
 
 
 # ── Minimax API ───────────────────────────────────────────────────────────────
@@ -74,7 +106,7 @@ def _call_model(messages: list) -> dict:
                  "Content-Type": "application/json"},
         json={"model": MODEL, "messages": messages,
               "tools": TOOL_DEFS, "tool_choice": "auto"},
-        timeout=60,
+        timeout=300,
     )
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]
@@ -118,12 +150,12 @@ class Agent:
         if name == "web_search":
             result = await self._mcp.call_tool("web_search", {"query": args.get("query", "")})
             return "\n".join(c.text for c in result.content if hasattr(c, "text")) or "No results."
-        if name == "read_file":
-            return _read_file(args.get("path", ""))
+        if name == "bash":
+            return _run_bash(args.get("command", "echo 'no command'"))
         return f"[agent] Unknown tool: {name}"
 
     # ── main loop ─────────────────────────────────────────────────────────────
-    async def run(self, task: str, system: str | None = None) -> dict:
+    async def run(self, task: str, system: str | None = None, verbose: bool = False) -> dict:
         """
         Run the agent on a single task.
         Returns: { "answer": str, "steps": int, "messages": list }
@@ -137,39 +169,48 @@ class Agent:
             msg = _call_model(messages)
             messages.append(msg)
 
+            # Log thinking (if present) and text content
+            content = msg.get("content", "") or ""
+            thinking = re.search(r"<think>(.*?)</think>", content, re.DOTALL)
+            if thinking:
+                _log(step + 1, "think", thinking.group(1).strip(), verbose)
+            clean = _strip_thinking(content)
+
             tool_calls = msg.get("tool_calls") or []
             if not tool_calls:
-                # No tool calls → final answer
-                return {"answer": msg.get("content", ""), "steps": step + 1, "messages": messages}
+                _log(step + 1, "answer", clean, verbose)
+                return {"answer": clean, "steps": step + 1, "messages": messages}
 
             for tc in tool_calls:
-                result = await self._execute(
-                    tc["function"]["name"],
-                    json.loads(tc["function"]["arguments"]),
-                )
+                name = tc["function"]["name"]
+                args = json.loads(tc["function"]["arguments"])
+                _log(step + 1, "tool_call", f"{name}({json.dumps(args, ensure_ascii=False)})", verbose)
+
+                result = await self._execute(name, args)
+                _log(step + 1, "tool_result", result, verbose)
+
                 messages.append({
                     "role":         "tool",
                     "tool_call_id": tc["id"],
-                    "content": [{"type": "text", "text": result, "name": tc["function"]["name"]}],
+                    "content": [{"type": "text", "text": result, "name": name}],
                 })
 
         # Hit MAX_STEPS
         last = next((m.get("content", "") for m in reversed(messages) if m["role"] == "assistant"), "")
-        return {"answer": last, "steps": MAX_STEPS, "messages": messages}
+        return {"answer": _strip_thinking(last), "steps": MAX_STEPS, "messages": messages}
 
 
 # ── Sync convenience wrapper ──────────────────────────────────────────────────
-def run_sync(task: str, system: str | None = None) -> dict:
+def run_sync(task: str, system: str | None = None, verbose: bool = False) -> dict:
     """Blocking wrapper — handy for REPL / one-off calls."""
     async def _inner():
         async with Agent() as agent:
-            return await agent.run(task, system)
+            return await agent.run(task, system, verbose=verbose)
     return asyncio.run(_inner())
 
 
 if __name__ == "__main__":
-    import sys
     q = " ".join(sys.argv[1:]) or "What is the capital of Japan?"
-    r = run_sync(q)
+    r = run_sync(q, verbose=True)
     print(r["answer"])
     print(f"\n[{r['steps']} step(s)]")

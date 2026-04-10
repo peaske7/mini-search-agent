@@ -4,17 +4,18 @@ Benchmark runner — loads tasks from CSV, runs agent, saves results.
 Resumes automatically from checkpoint (already-completed task_ids are skipped).
 
 Usage:
-    python bench.py --tasks data/smoke_test.csv --out results/smoke.csv --preset gaia
-    python bench.py --tasks data/widesearch.csv --out results/ws.csv --preset widesearch
-    python bench.py --tasks data/custom.csv --out results/custom.csv --system "You are..."
+    python -m bench --tasks data/gaia_val.csv --out results/gaia.csv --preset gaia
+    python -m bench --out results/ws.jsonl --preset widesearch [--lang en]
+    python -m bench --tasks data/custom.csv --out results/custom.csv --system "You are..."
 
 Expected CSV columns:
     GAIA      : task_id, Question, Final answer, Level
-    WideSearch: task_id, question, answer          (answer may be empty)
     Custom    : task_id, question, answer          (answer may be empty)
+
+For WideSearch, tasks are loaded automatically from HuggingFace — no --tasks needed.
 """
 
-import argparse, asyncio, csv, re, time
+import argparse, asyncio, csv, json, re, time
 from datetime import datetime
 from pathlib import Path
 
@@ -29,9 +30,16 @@ PRESETS = {
         "Do not include explanation unless the question explicitly asks for it."
     ),
     "widesearch": (
-        "You are a data researcher populating a table. "
-        "For each question, search the web to find the most accurate current value. "
-        "Return only the answer value, nothing else."
+        "You are a meticulous data researcher. Your task is to search the web and "
+        "compile a comprehensive Markdown table with ALL rows and columns requested. "
+        "Completeness is critical — find every item, not just a few examples.\n\n"
+        "Rules:\n"
+        "- Search systematically. Use multiple queries to cover the full scope.\n"
+        "- Return your final answer as a Markdown table inside a ```markdown fence.\n"
+        "- Include ALL columns mentioned in the task. Use the exact column names.\n"
+        "- Include as many rows as possible — more is better than fewer.\n"
+        "- If a cell value is unknown after searching, write 'N/A'.\n"
+        "- Do NOT include any text outside the ```markdown fence in your final answer."
     ),
     "enrichment": (
         "You are a Japanese business analyst. "
@@ -159,26 +167,149 @@ async def run_benchmark(
     print(f"Output   : {out_csv}")
 
 
+# ── WideSearch runner ────────────────────────────────────────────────────────
+async def run_widesearch(
+    out_path: str,
+    system_prompt: str,
+    language: str | None = None,
+    delay: float = 1.0,
+    verbose: bool = True,
+    limit: int | None = None,
+):
+    """Run the agent on WideSearch tasks and evaluate with multi-metric scoring."""
+    from bench import widesearch as ws
+
+    tasks = ws.load_tasks(language)
+    if limit:
+        tasks = tasks[:limit]
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load already-completed instance_ids for resume
+    done: set[str] = set()
+    if out.exists():
+        with open(out, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    done.add(json.loads(line)["instance_id"])
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+    results: list[ws.EvalResult] = []
+
+    async with ag.Agent() as agent:
+        for i, task in enumerate(tasks):
+            iid = task["instance_id"]
+            if iid in done:
+                if verbose:
+                    print(f"  [skip] {iid}")
+                continue
+
+            query = task["query"]
+            if verbose:
+                print(f"[{i+1}/{len(tasks)}] {iid}: {query[:80]}{'…' if len(query)>80 else ''}")
+
+            # Run agent
+            response = ""
+            steps = 0
+            try:
+                r = await agent.run(query, system=system_prompt)
+                response = r["answer"]
+                steps = r["steps"]
+            except Exception as e:
+                response = f"ERROR: {e}"
+
+            # Evaluate
+            eval_config = json.loads(task["evaluation"]) if isinstance(task["evaluation"], str) else task["evaluation"]
+            try:
+                gold_df = ws.load_gold(iid)
+                ev = ws.evaluate_task(iid, response, gold_df, eval_config)
+            except Exception as e:
+                ev = ws.EvalResult(instance_id=iid, error=str(e))
+
+            results.append(ev)
+
+            # Write result line (JSONL for rich data)
+            record = {
+                "instance_id": iid,
+                "language": task["language"],
+                "steps": steps,
+                "row_f1": round(ev.row_f1, 4),
+                "item_f1": round(ev.item_f1, 4),
+                "row_precision": round(ev.row_precision, 4),
+                "row_recall": round(ev.row_recall, 4),
+                "item_precision": round(ev.item_precision, 4),
+                "item_recall": round(ev.item_recall, 4),
+                "matched_rows": ev.matched_rows,
+                "pred_rows": ev.pred_rows,
+                "gold_rows": ev.gold_rows,
+                "error": ev.error,
+                "response": response[:2000],  # truncate for storage
+                "timestamp": datetime.now().isoformat(),
+            }
+            with open(out, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+            if verbose:
+                status = f"row_F1={ev.row_f1:.2f} item_F1={ev.item_f1:.2f}"
+                if ev.error:
+                    status += f" err={ev.error}"
+                print(f"  → {ev.matched_rows}/{ev.gold_rows} rows matched | {status}")
+
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+    # Summary
+    if results:
+        avg_row_f1 = sum(r.row_f1 for r in results) / len(results)
+        avg_item_f1 = sum(r.item_f1 for r in results) / len(results)
+        errors = sum(1 for r in results if r.error)
+        print(f"\n{'─'*50}")
+        print(f"WideSearch Results ({len(results)} tasks)")
+        print(f"  Avg Row  F1 : {avg_row_f1:.3f}")
+        print(f"  Avg Item F1 : {avg_item_f1:.3f}")
+        if errors:
+            print(f"  Errors      : {errors}")
+        print(f"  Output      : {out_path}")
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tasks",  required=True,             help="Input task CSV")
-    ap.add_argument("--out",    required=True,             help="Output results CSV")
+    ap.add_argument("--tasks",  default=None,              help="Input task CSV (not needed for widesearch)")
+    ap.add_argument("--out",    required=True,             help="Output results file")
     ap.add_argument("--preset", default="gaia",
                     choices=list(PRESETS.keys()),           help="System prompt preset")
     ap.add_argument("--system", default=None,              help="Custom system prompt (overrides --preset)")
     ap.add_argument("--delay",  type=float, default=0.5,   help="Seconds between tasks")
     ap.add_argument("--quiet",  action="store_true",       help="Suppress per-task output")
+    ap.add_argument("--lang",   default=None, choices=["en", "zh"],
+                    help="WideSearch: filter by language")
+    ap.add_argument("--limit",  type=int, default=None,    help="WideSearch: max tasks to run")
     args = ap.parse_args()
 
     system = args.system or PRESETS[args.preset]
-    asyncio.run(run_benchmark(
-        tasks_csv=args.tasks,
-        out_csv=args.out,
-        system_prompt=system,
-        delay=args.delay,
-        verbose=not args.quiet,
-    ))
+
+    if args.preset == "widesearch":
+        asyncio.run(run_widesearch(
+            out_path=args.out,
+            system_prompt=system,
+            language=args.lang,
+            delay=args.delay,
+            verbose=not args.quiet,
+            limit=args.limit,
+        ))
+    else:
+        if not args.tasks:
+            ap.error("--tasks is required for non-widesearch presets")
+        asyncio.run(run_benchmark(
+            tasks_csv=args.tasks,
+            out_csv=args.out,
+            system_prompt=system,
+            delay=args.delay,
+            verbose=not args.quiet,
+        ))
 
 
 if __name__ == "__main__":
