@@ -48,6 +48,27 @@ python -m bench --tasks data/custom.csv --out results/custom.csv \
   --system "You are a precise assistant. Answer concisely."
 ```
 
+### Enrichment (company scoring)
+
+Enrich and score companies from a CSV against user-defined criteria.
+
+```bash
+# With context file (criteria, instructions, examples)
+python -m bench --preset enrich --tasks data/companies.csv \
+  --out results/leads.csv --context data/criteria.md
+
+# With inline criteria
+python -m bench --preset enrich --tasks data/companies.csv \
+  --out results/leads.csv --criteria "B2B cosmetics brands with DTC in Japan"
+```
+
+Outputs two files:
+
+- `results/leads.csv` — all rows, enriched with score/qualifies/reasoning
+- `results/leads_qualified.csv` — only qualifying rows
+
+See `data/test_criteria.md` for context file format.
+
 ## Presets
 
 | Preset | Use for |
@@ -55,3 +76,4 @@ python -m bench --tasks data/custom.csv --out results/custom.csv \
 | `gaia` | GAIA Level 1-3, concise single-answer questions |
 | `widesearch` | WideSearch, structured table collection from live web |
 | `enrichment` | Japanese company name resolution, JSON output |
+| `enrich` | Company enrichment & scoring against user-defined criteria |
