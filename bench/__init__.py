@@ -1,2 +1,1 @@
-# Lazy imports — avoid pulling in agent.py (which requires API keys) at import time.
-# Use: from bench.runner import ... or from bench.widesearch import ...
+

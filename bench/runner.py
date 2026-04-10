@@ -1,27 +1,19 @@
 #!/usr/bin/env python3
 """
-Benchmark runner — loads tasks from CSV, runs agent, saves results.
-Resumes automatically from checkpoint (already-completed task_ids are skipped).
+Benchmark runner — loads tasks, runs agent, saves results with checkpointing.
 
 Usage:
     python -m bench --tasks data/gaia_val.csv --out results/gaia.csv --preset gaia
     python -m bench --out results/ws.jsonl --preset widesearch [--lang en]
     python -m bench --tasks data/custom.csv --out results/custom.csv --system "You are..."
-
-Expected CSV columns:
-    GAIA      : task_id, Question, Final answer, Level
-    Custom    : task_id, question, answer          (answer may be empty)
-
-For WideSearch, tasks are loaded automatically from HuggingFace — no --tasks needed.
 """
 
-import argparse, asyncio, csv, json, re, time
+import argparse, asyncio, csv, json, re
 from datetime import datetime
 from pathlib import Path
 
 import agent as ag
 
-# ── System prompt presets ─────────────────────────────────────────────────────
 PRESETS = {
     "gaia": (
         "You are a precise research assistant. "
@@ -52,7 +44,7 @@ PRESETS = {
     ),
 }
 
-# ── CSV helpers ───────────────────────────────────────────────────────────────
+
 def load_tasks(path: str) -> list[dict]:
     with open(path, newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
@@ -66,7 +58,6 @@ def load_done(path: str) -> set[str]:
         return {r["task_id"] for r in csv.DictReader(f) if r.get("task_id")}
 
 
-# ── Scoring ───────────────────────────────────────────────────────────────────
 def _norm(s: str) -> str:
     s = s.lower().strip()
     s = re.sub(r"[^\w\s]", "", s)
@@ -75,12 +66,11 @@ def _norm(s: str) -> str:
 
 def score(predicted: str, expected: str) -> "bool | str":
     if not expected or not expected.strip():
-        return ""  # no ground truth — leave blank
+        return ""
     np, ne = _norm(predicted), _norm(expected)
     return np == ne or ne in np
 
 
-# ── Main runner ───────────────────────────────────────────────────────────────
 async def run_benchmark(
     tasks_csv: str,
     out_csv: str,
@@ -91,7 +81,6 @@ async def run_benchmark(
     tasks = load_tasks(tasks_csv)
     done  = load_done(out_csv)
 
-    # Detect GAIA vs generic column names
     sample = tasks[0] if tasks else {}
     q_col  = "Question"     if "Question"     in sample else "question"
     a_col  = "Final answer" if "Final answer" in sample else "answer"
@@ -158,7 +147,6 @@ async def run_benchmark(
                 if delay > 0:
                     await asyncio.sleep(delay)
 
-    # Summary
     print(f"\n{'─'*40}")
     if scored_count > 0:
         print(f"Accuracy : {correct_count/scored_count:.1%}  ({correct_count}/{scored_count})")
@@ -167,7 +155,6 @@ async def run_benchmark(
     print(f"Output   : {out_csv}")
 
 
-# ── WideSearch runner ────────────────────────────────────────────────────────
 async def run_widesearch(
     out_path: str,
     system_prompt: str,
@@ -176,7 +163,6 @@ async def run_widesearch(
     verbose: bool = True,
     limit: int | None = None,
 ):
-    """Run the agent on WideSearch tasks and evaluate with multi-metric scoring."""
     from bench import widesearch as ws
 
     tasks = ws.load_tasks(language)
@@ -186,7 +172,6 @@ async def run_widesearch(
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    # Load already-completed instance_ids for resume
     done: set[str] = set()
     if out.exists():
         with open(out, encoding="utf-8") as f:
@@ -210,7 +195,6 @@ async def run_widesearch(
             if verbose:
                 print(f"[{i+1}/{len(tasks)}] {iid}: {query[:80]}{'…' if len(query)>80 else ''}")
 
-            # Run agent
             response = ""
             steps = 0
             try:
@@ -220,7 +204,6 @@ async def run_widesearch(
             except Exception as e:
                 response = f"ERROR: {e}"
 
-            # Evaluate
             eval_config = json.loads(task["evaluation"]) if isinstance(task["evaluation"], str) else task["evaluation"]
             try:
                 gold_df = ws.load_gold(iid)
@@ -230,7 +213,6 @@ async def run_widesearch(
 
             results.append(ev)
 
-            # Write result line (JSONL for rich data)
             record = {
                 "instance_id": iid,
                 "language": task["language"],
@@ -245,7 +227,7 @@ async def run_widesearch(
                 "pred_rows": ev.pred_rows,
                 "gold_rows": ev.gold_rows,
                 "error": ev.error,
-                "response": response[:2000],  # truncate for storage
+                "response": response[:2000],
                 "timestamp": datetime.now().isoformat(),
             }
             with open(out, "a", encoding="utf-8") as f:
@@ -260,7 +242,6 @@ async def run_widesearch(
             if delay > 0:
                 await asyncio.sleep(delay)
 
-    # Summary
     if results:
         avg_row_f1 = sum(r.row_f1 for r in results) / len(results)
         avg_item_f1 = sum(r.item_f1 for r in results) / len(results)
@@ -274,7 +255,6 @@ async def run_widesearch(
         print(f"  Output      : {out_path}")
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tasks",  default=None,              help="Input task CSV (not needed for widesearch)")
