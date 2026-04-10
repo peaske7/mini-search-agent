@@ -42,6 +42,7 @@ PRESETS = {
         'Reply ONLY as JSON: {"canonical":"...","is_cosmetics":"yes|no|unclear",'
         '"parent":"...","category":"brand|temp_agency|salon|retailer|other","note":"..."}'
     ),
+    "enrich": "(dynamic — built by bench/enrich.py)",
 }
 
 
@@ -267,7 +268,25 @@ def main():
     ap.add_argument("--lang",   default=None, choices=["en", "zh"],
                     help="WideSearch: filter by language")
     ap.add_argument("--limit",  type=int, default=None,    help="WideSearch: max tasks to run")
+    ap.add_argument("--criteria", default=None,            help="Natural language scoring criteria (for enrich preset)")
+    ap.add_argument("--context",  default=None,            help="Path to context Markdown file (for enrich preset)")
     args = ap.parse_args()
+
+    if args.preset == "enrich":
+        from bench.enrich import run_enrichment
+        if not args.tasks:
+            ap.error("--tasks is required for enrich preset")
+        if not args.criteria and not args.context:
+            ap.error("--criteria or --context is required for enrich preset")
+        asyncio.run(run_enrichment(
+            tasks_csv=args.tasks,
+            out_path=args.out,
+            criteria=args.criteria or "",
+            context_path=args.context,
+            delay=args.delay,
+            verbose=not args.quiet,
+        ))
+        return
 
     system = args.system or PRESETS[args.preset]
 
